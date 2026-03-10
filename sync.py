@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import ssl
 import time
@@ -64,6 +65,9 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 # Retry settings
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
 RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "2.0"))
+
+# Daemon settings
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "120"))  # seconds
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -500,6 +504,7 @@ environment variables:
   DEBUG                Set to any value to enable debug logging
   RETRY_ATTEMPTS       Number of retry attempts for failed requests (default: 3)
   RETRY_BACKOFF_BASE   Base for exponential backoff in seconds (default: 2.0)
+  SYNC_INTERVAL        Seconds between sync cycles in --daemon mode (default: 120)
 
 exit codes:
   0  Success (or no changes needed)
@@ -525,6 +530,9 @@ examples:
 
   # Rollback for real
   PIHOLE_PASSWORD=secret python3 sync.py --rollback /opt/traefik-dns-sync/backups/192.168.1.2_2026-02-19T221000Z.json
+
+  # Run as a daemon (polls every SYNC_INTERVAL seconds)
+  python3 sync.py --daemon
 """,
     )
     parser.add_argument(
@@ -542,48 +550,21 @@ examples:
         action="store_true",
         help="Log conflicting DNS entries but do not remove them. By default, entries for Traefik-managed hostnames pointing to a different IP are replaced.",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run continuously, syncing every SYNC_INTERVAL seconds (default: 120). Replaces cron.",
+    )
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    # Verify required configuration
-    if not TRAEFIK_IP:
-        log.error("TRAEFIK_IP is not set")
-        sys.exit(EXIT_CONFIG_ERROR)
-    if not PIHOLE_HOSTS:
-        log.error("PIHOLE_HOSTS is not set")
-        sys.exit(EXIT_CONFIG_ERROR)
-    has_password = bool(PIHOLE_PASSWORD) or any(
-        os.environ.get(f"PIHOLE_PASSWORD_{h.replace('.', '_')}")
-        for h in PIHOLE_HOSTS
-    )
-    if not has_password:
-        log.error("No Pi-hole password configured. Set PIHOLE_PASSWORD or per-instance PIHOLE_PASSWORD_<IP>.")
-        sys.exit(EXIT_CONFIG_ERROR)
-
-    # --list-backups: show available backups and exit
-    if args.list_backups:
-        pattern = os.path.join(BACKUP_DIR, "*.json")
-        files = sorted(glob.glob(pattern))
-        if not files:
-            print("No backups found.")
-        else:
-            for f in files:
-                print(f)
-        return
-
-    # --rollback: restore from backup and exit
-    if args.rollback:
-        rollback(args.rollback)
-        return
-
+def run_sync(replace_conflicts=True):
+    """Execute a single sync cycle. Returns an exit code (does not call sys.exit)."""
     # Step 1: Fetch routers from Traefik
     routers = fetch_traefik_routers()
     if routers is None:
         log.error("Cannot reach Traefik API — aborting (cache untouched)")
-        sys.exit(EXIT_TRAEFIK_ERROR)
+        return EXIT_TRAEFIK_ERROR
     log.debug("Fetched %d routers from Traefik", len(routers))
 
     # Step 2: Extract and filter hostnames
@@ -594,10 +575,9 @@ def main():
     current_hash = compute_hash(hostnames)
     if not has_changed(current_hash):
         log.info("NO CHANGE (%d hostnames)", len(hostnames))
-        return
+        return EXIT_OK
 
     # Step 4: Sync to each Pi-hole instance (per-instance resilience)
-    replace_conflicts = not args.no_replace_conflicts
     all_added = []
     all_removed = []
     all_conflicts = []
@@ -644,8 +624,73 @@ def main():
         ", ".join(removed_unique) if removed_unique else "(none)",
     )
 
-    if failed_hosts:
-        sys.exit(EXIT_PIHOLE_ERROR)
+    return EXIT_PIHOLE_ERROR if failed_hosts else EXIT_OK
+
+
+def main():
+    args = parse_args()
+
+    # Verify required configuration
+    if not TRAEFIK_IP:
+        log.error("TRAEFIK_IP is not set")
+        sys.exit(EXIT_CONFIG_ERROR)
+    if not PIHOLE_HOSTS:
+        log.error("PIHOLE_HOSTS is not set")
+        sys.exit(EXIT_CONFIG_ERROR)
+    has_password = bool(PIHOLE_PASSWORD) or any(
+        os.environ.get(f"PIHOLE_PASSWORD_{h.replace('.', '_')}")
+        for h in PIHOLE_HOSTS
+    )
+    if not has_password:
+        log.error("No Pi-hole password configured. Set PIHOLE_PASSWORD or per-instance PIHOLE_PASSWORD_<IP>.")
+        sys.exit(EXIT_CONFIG_ERROR)
+
+    # --list-backups: show available backups and exit
+    if args.list_backups:
+        pattern = os.path.join(BACKUP_DIR, "*.json")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            print("No backups found.")
+        else:
+            for f in files:
+                print(f)
+        return
+
+    # --rollback: restore from backup and exit
+    if args.rollback:
+        rollback(args.rollback)
+        return
+
+    replace_conflicts = not args.no_replace_conflicts
+
+    # --daemon: run continuously
+    if args.daemon:
+        log.info("Starting daemon mode (interval=%ds)", SYNC_INTERVAL)
+        shutdown = False
+
+        def handle_signal(signum, frame):
+            nonlocal shutdown
+            log.info("Received signal %d — shutting down", signum)
+            shutdown = True
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        while not shutdown:
+            run_sync(replace_conflicts)
+            # Sleep in small increments so we can respond to signals promptly
+            for _ in range(SYNC_INTERVAL):
+                if shutdown:
+                    break
+                time.sleep(1)
+
+        log.info("Daemon stopped")
+        return
+
+    # One-shot mode (default, cron-compatible)
+    rc = run_sync(replace_conflicts)
+    if rc != EXIT_OK:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":
