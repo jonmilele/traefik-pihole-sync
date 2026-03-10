@@ -49,7 +49,12 @@ DRY_RUN=true DEBUG=1 python3 /opt/traefik-dns-sync/sync.py
 # 4. Run for real
 python3 /opt/traefik-dns-sync/sync.py
 
-# 5. Add to cron (every 2 minutes)
+# 5a. Option A: Run as a systemd daemon (recommended)
+sudo cp /opt/traefik-dns-sync/traefik-pihole-sync.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now traefik-pihole-sync
+
+# 5b. Option B: Run via cron (every 2 minutes)
 (crontab -l 2>/dev/null; echo "*/2 * * * * /opt/traefik-dns-sync/sync.sh >> /var/log/traefik-dns-sync.log 2>&1") | crontab -
 ```
 
@@ -75,6 +80,7 @@ All configuration is via environment variables:
 | `DEBUG` | *(unset)* | Enable debug logging |
 | `RETRY_ATTEMPTS` | `3` | Number of retry attempts for failed API requests |
 | `RETRY_BACKOFF_BASE` | `2.0` | Base for exponential backoff (seconds) |
+| `SYNC_INTERVAL` | `120` | Seconds between sync cycles in `--daemon` mode |
 
 ## Pi-hole Setup
 
@@ -115,7 +121,7 @@ PIHOLE_PASSWORD=... python3 sync.py --rollback /opt/traefik-dns-sync/backups/192
 
 ## Error Handling
 
-The script is designed to keep running reliably in unattended cron environments:
+The script is designed to keep running reliably in unattended environments:
 
 - **Retry with backoff** — failed API requests are retried up to 3 times (configurable) with exponential backoff. Only network errors and 5xx responses are retried; 4xx errors fail immediately.
 - **Per-instance resilience** — if one Pi-hole is unreachable or auth fails, the script logs the error and continues syncing to the remaining instances instead of aborting.
@@ -163,8 +169,31 @@ Other scripts that solve this problem tend to be Docker-first Go applications wi
 | **Change detection** | SHA256 hash cache — skips Pi-hole API when nothing changed | Queries both APIs every interval |
 | **Backup & rollback** | Auto-backup before sync, `--rollback` to restore | Not supported |
 | **Router filtering** | Auto-excludes `@internal`, configurable blocklist | No filtering |
-| **Scheduling** | System cron (external) | Built-in cron scheduler |
+| **Scheduling** | `--daemon` mode or system cron | Built-in cron scheduler |
 | **Runtime requirements** | Python 3.6+ | Docker |
+
+## Daemon Mode
+
+The script can run as a long-lived daemon instead of via cron, polling at a configurable interval:
+
+```bash
+# Set interval in .env (optional, default is 120 seconds)
+SYNC_INTERVAL=120
+
+# Run directly
+python3 sync.py --daemon
+
+# Or install the included systemd service
+sudo cp traefik-pihole-sync.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now traefik-pihole-sync
+
+# Check status / logs
+sudo systemctl status traefik-pihole-sync
+sudo journalctl -u traefik-pihole-sync -f
+```
+
+The daemon handles `SIGTERM` and `SIGINT` for clean shutdown, and systemd will restart it automatically on failure. One-shot mode (without `--daemon`) still works for cron.
 
 ## Tested On
 
