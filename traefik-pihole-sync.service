@@ -1,12 +1,13 @@
 [Unit]
 Description=Traefik to Pi-hole DNS sync
 Documentation=https://github.com/jonmilele/traefik-pihole-sync
-After=network-online.target
+After=network-online.target traefik.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=/opt/traefik-dns-sync/.env
+ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/python3 /opt/traefik-dns-sync/sync.py --daemon
 Restart=on-failure
 RestartSec=30
