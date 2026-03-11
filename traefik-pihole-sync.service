@@ -9,6 +9,8 @@ Type=simple
 EnvironmentFile=/opt/traefik-dns-sync/.env
 ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/python3 /opt/traefik-dns-sync/sync.py --daemon
+StandardOutput=append:/var/log/traefik-dns-sync/sync.log
+StandardError=append:/var/log/traefik-dns-sync/sync.log
 Restart=on-failure
 RestartSec=30
 
