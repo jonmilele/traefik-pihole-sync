@@ -55,7 +55,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now traefik-pihole-sync
 
 # 5b. Option B: Run via cron (every 2 minutes)
-(crontab -l 2>/dev/null; echo "*/2 * * * * /opt/traefik-dns-sync/sync.sh >> /var/log/traefik-dns-sync.log 2>&1") | crontab -
+sudo mkdir -p /var/log/traefik-dns-sync
+(crontab -l 2>/dev/null; echo "*/2 * * * * /opt/traefik-dns-sync/sync.sh >> /var/log/traefik-dns-sync/sync.log 2>&1") | crontab -
 ```
 
 ## Configuration
@@ -194,6 +195,46 @@ sudo journalctl -u traefik-pihole-sync -f
 ```
 
 The daemon handles `SIGTERM` and `SIGINT` for clean shutdown, and systemd will restart it automatically on failure. One-shot mode (without `--daemon`) still works for cron.
+
+## Logging
+
+Where logs end up depends on how you run the script:
+
+**Systemd daemon (default)** — logs go to journald:
+
+```bash
+# Follow live
+sudo journalctl -u traefik-pihole-sync -f
+
+# Last 50 lines
+sudo journalctl -u traefik-pihole-sync -n 50
+```
+
+To also write to a log file, uncomment the `StandardOutput` and `StandardError` lines in the service file, then create the directory and restart:
+
+```bash
+sudo mkdir -p /var/log/traefik-dns-sync
+sudo systemctl daemon-reload
+sudo systemctl restart traefik-pihole-sync
+```
+
+**Cron** — logs go to the file specified in the cron entry (e.g. `/var/log/traefik-dns-sync/sync.log`).
+
+For either method, add a logrotate config to manage file size:
+
+```bash
+sudo tee /etc/logrotate.d/traefik-dns-sync << 'EOF'
+/var/log/traefik-dns-sync/sync.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+```
 
 ## Tested On
 

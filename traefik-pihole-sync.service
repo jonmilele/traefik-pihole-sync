@@ -9,15 +9,18 @@ Type=simple
 EnvironmentFile=/opt/traefik-dns-sync/.env
 ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/python3 /opt/traefik-dns-sync/sync.py --daemon
-StandardOutput=append:/var/log/traefik-dns-sync/sync.log
-StandardError=append:/var/log/traefik-dns-sync/sync.log
 Restart=on-failure
 RestartSec=30
+
+# Logging: journald by default (journalctl -u traefik-pihole-sync)
+# Uncomment the lines below to also write to a log file:
+#StandardOutput=append:/var/log/traefik-dns-sync/sync.log
+#StandardError=append:/var/log/traefik-dns-sync/sync.log
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/traefik-dns-sync
+ReadWritePaths=/opt/traefik-dns-sync /var/log/traefik-dns-sync
 
 [Install]
 WantedBy=multi-user.target
