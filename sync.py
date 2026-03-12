@@ -68,6 +68,7 @@ RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "2.0"))
 
 # Daemon settings
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "120"))  # seconds
+MANAGE_LOCAL_DNS = os.environ.get("MANAGE_LOCAL_DNS", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -81,6 +82,9 @@ log = logging.getLogger("traefik-pihole-sync")
 
 # Regex to extract hostnames from Traefik rules like: Host(`foo.local`)
 HOST_RE = re.compile(r"Host\(`([^`]+)`\)")
+
+# Regex to identify our managed dnsmasq local= lines: local=/some.host.tld/
+LOCAL_RE = re.compile(r"^local=/[^/]+/$")
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +319,130 @@ def pihole_delete_host(host, headers, entry):
     return status in (200, 204)
 
 
+def pihole_get_dnsmasq_lines(host, headers):
+    """
+    GET /api/config/misc/dnsmasq_lines — returns list of custom dnsmasq config
+    lines currently configured on this Pi-hole.
+    """
+    url = f"{pihole_url(host)}/config/misc/dnsmasq_lines"
+    status, data = api_request_with_retry(url, headers=headers)
+    if status != 200 or data is None:
+        log.error("Failed to fetch dnsmasq_lines from Pi-hole %s (status %d)", host, status)
+        return None
+
+    try:
+        lines = data["config"]["misc"]["dnsmasq_lines"]
+    except (KeyError, TypeError):
+        log.warning("Unexpected dnsmasq_lines response from Pi-hole %s: %s", host, str(data)[:200])
+        return None
+
+    if not isinstance(lines, list):
+        log.warning("Pi-hole %s returned non-list for dnsmasq_lines (got %s)", host, type(lines).__name__)
+        return None
+
+    return lines
+
+
+def pihole_set_dnsmasq_lines(host, headers, lines):
+    """
+    PATCH /api/config/misc — replace the entire misc.dnsmasq_lines array.
+
+    The Pi-hole v6 config API does not support per-item PUT/DELETE for
+    dnsmasq_lines (unlike dns/hosts). Instead, the full array must be
+    written at once via PATCH.
+    """
+    url = f"{pihole_url(host)}/config/misc"
+    payload = {"config": {"misc": {"dnsmasq_lines": lines}}}
+    status, _ = api_request_with_retry(url, method="PATCH", data=payload, headers=headers)
+    return status == 200
+
+
+def sync_dnsmasq_local_rules(host, headers, desired_hostnames):
+    """
+    Sync per-host local=/fqdn/ dnsmasq rules on a Pi-hole instance.
+
+    For each managed hostname (e.g. home.milele.net), ensures a corresponding
+    "local=/home.milele.net/" line exists in misc.dnsmasq_lines. This makes
+    Pi-hole authoritative only for those specific FQDNs (fixing AAAA resolution)
+    without hijacking the entire parent domain.
+
+    Also removes any blanket "local=/milele.net/" rules that would overlap with
+    managed hostnames' parent domains.
+
+    Only touches lines matching the local=/.../ pattern; other dnsmasq config
+    lines are preserved.
+
+    Returns (added_list, removed_list, had_errors).
+    """
+    current_lines = pihole_get_dnsmasq_lines(host, headers)
+    if current_lines is None:
+        return [], [], True
+
+    # Build desired set of local= rules from managed hostnames
+    desired_local = {f"local=/{h}/" for h in desired_hostnames}
+
+    # Separate current lines into local= rules (managed) and others (preserved)
+    current_local = set()
+    preserved_lines = []
+    for line in current_lines:
+        if LOCAL_RE.match(line):
+            current_local.add(line)
+        else:
+            preserved_lines.append(line)
+
+    # Detect blanket parent-domain rules that conflict with per-host rules.
+    # e.g. if we manage home.milele.net, a "local=/milele.net/" would hijack all *.milele.net
+    parent_domains = set()
+    for h in desired_hostnames:
+        parts = h.split(".")
+        for i in range(1, len(parts)):
+            parent_domains.add(".".join(parts[i:]))
+    blanket_rules = {line for line in current_local
+                     if line[7:-1] in parent_domains}
+
+    to_add = desired_local - current_local
+    to_remove = (current_local - desired_local) | blanket_rules
+
+    # If nothing changed, skip the PATCH
+    if not to_add and not to_remove:
+        return [], [], False
+
+    # Log what will change
+    for line in sorted(to_remove):
+        if line in blanket_rules:
+            if DRY_RUN:
+                log.info("[DRY RUN] Would remove blanket rule from %s: %s", host, line)
+            else:
+                log.warning("Removing blanket domain rule from %s: %s (conflicts with per-host rules)", host, line)
+        else:
+            if DRY_RUN:
+                log.info("[DRY RUN] Would remove dnsmasq rule from %s: %s", host, line)
+            else:
+                log.debug("Removing stale dnsmasq rule from %s: %s", host, line)
+
+    for line in sorted(to_add):
+        if DRY_RUN:
+            log.info("[DRY RUN] Would add dnsmasq rule to %s: %s", host, line)
+        else:
+            log.debug("Adding dnsmasq rule to %s: %s", host, line)
+
+    added = sorted(to_add)
+    removed = sorted(to_remove)
+
+    if DRY_RUN:
+        return added, removed, False
+
+    # Build the new complete array: preserved non-local= lines + desired local= lines
+    new_lines = preserved_lines + sorted(desired_local)
+
+    if pihole_set_dnsmasq_lines(host, headers, new_lines):
+        log.info("Updated dnsmasq_lines on %s: +%d -%d local= rules", host, len(to_add), len(to_remove))
+        return added, removed, False
+    else:
+        log.error("Failed to PATCH dnsmasq_lines on %s", host)
+        return [], [], True
+
+
 # ---------------------------------------------------------------------------
 # Backup & rollback
 # ---------------------------------------------------------------------------
@@ -393,7 +521,7 @@ def rollback(backup_file):
 def sync_pihole(host, desired_hostnames, replace_conflicts=True):
     """
     Sync the desired hostname set to a single Pi-hole instance.
-    Returns (added_list, removed_list, conflict_list, had_errors).
+    Returns (added_list, removed_list, conflict_list, dnsmasq_added, dnsmasq_removed, had_errors).
     Raises PiholeAuthError if authentication fails.
 
     If replace_conflicts is True, existing DNS entries for Traefik-managed
@@ -475,7 +603,17 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
                     continue
             removed.append(entry.split(" ", 1)[1])
 
-        return added, removed, conflicts, errors
+        # Sync per-host local= dnsmasq rules (if enabled)
+        dnsmasq_added = []
+        dnsmasq_removed = []
+        if MANAGE_LOCAL_DNS:
+            dnsmasq_added, dnsmasq_removed, dnsmasq_errors = sync_dnsmasq_local_rules(
+                host, headers, desired_hostnames,
+            )
+            if dnsmasq_errors:
+                errors = True
+
+        return added, removed, conflicts, dnsmasq_added, dnsmasq_removed, errors
     finally:
         pihole_logout(host, sid)
 
@@ -505,6 +643,7 @@ environment variables:
   RETRY_ATTEMPTS       Number of retry attempts for failed requests (default: 3)
   RETRY_BACKOFF_BASE   Base for exponential backoff in seconds (default: 2.0)
   SYNC_INTERVAL        Seconds between sync cycles in --daemon mode (default: 120)
+  MANAGE_LOCAL_DNS     Manage per-host local=/fqdn/ dnsmasq rules (default: true)
 
 exit codes:
   0  Success (or no changes needed)
@@ -583,13 +722,20 @@ def run_sync(replace_conflicts=True):
     all_conflicts = []
     failed_hosts = []
 
+    all_dnsmasq_added = []
+    all_dnsmasq_removed = []
+
     for host in PIHOLE_HOSTS:
         log.info("Syncing to Pi-hole %s ...", host)
         try:
-            added, removed, conflicts, errors = sync_pihole(host, hostnames, replace_conflicts)
+            added, removed, conflicts, dnsmasq_added, dnsmasq_removed, errors = sync_pihole(
+                host, hostnames, replace_conflicts,
+            )
             all_added.extend(added)
             all_removed.extend(removed)
             all_conflicts.extend(conflicts)
+            all_dnsmasq_added.extend(dnsmasq_added)
+            all_dnsmasq_removed.extend(dnsmasq_removed)
             if errors:
                 failed_hosts.append(host)
         except PiholeAuthError as e:
@@ -614,9 +760,14 @@ def run_sync(replace_conflicts=True):
     added_unique = sorted(set(all_added))
     removed_unique = sorted(set(all_removed))
     conflict_unique = sorted(set(all_conflicts))
+    dnsmasq_added_unique = sorted(set(all_dnsmasq_added))
+    dnsmasq_removed_unique = sorted(set(all_dnsmasq_removed))
+
     summary = "SYNC: +%d -%d" % (len(added_unique), len(removed_unique))
     if conflict_unique:
         summary += " ~%d conflicts" % len(conflict_unique)
+    if dnsmasq_added_unique or dnsmasq_removed_unique:
+        summary += " | dnsmasq local= +%d -%d" % (len(dnsmasq_added_unique), len(dnsmasq_removed_unique))
     log.info(
         "%s | added: %s | removed: %s",
         summary,
