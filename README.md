@@ -182,7 +182,7 @@ Other scripts that solve this problem tend to be Docker-first Go applications wi
 | | This script | Other implementations |
 |---|---|---|
 | **Language** | Python (stdlib only, zero dependencies) | Go (compiled, external dependencies) |
-| **Deployment** | Standalone script + cron | Docker container |
+| **Deployment** | Standalone script + systemd or cron | Docker container |
 | **Multiple Pi-holes** | Yes, with per-instance passwords | Single instance only |
 | **Stale record cleanup** | Automatic — removes entries for routers that no longer exist | Not supported |
 | **Change detection** | SHA256 hash cache — skips Pi-hole API when nothing changed | Queries both APIs every interval |
