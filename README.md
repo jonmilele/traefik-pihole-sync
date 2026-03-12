@@ -16,6 +16,7 @@ When services are added or removed behind Traefik, this script polls the Traefik
 - **Structured logging** — clear summaries of what changed
 - **Error handling** — retry with backoff, per-instance resilience, distinct exit codes, session cleanup
 - **Conflict resolution** — detects and replaces existing DNS entries that point to the wrong IP
+- **Per-host local DNS rules** — manages `local=/fqdn/` dnsmasq rules via Pi-hole's config API, fixing AAAA resolution for local records without hijacking the parent domain
 
 ## How It Works
 
@@ -25,7 +26,8 @@ When services are added or removed behind Traefik, this script polls the Traefik
 4. Authenticates with each Pi-hole v6 instance
 5. Backs up current DNS entries to a timestamped JSON file
 6. Diffs desired vs. current entries (scoped to the Traefik IP) and applies adds/removes
-7. Saves the cache hash on success
+7. Syncs per-host `local=/fqdn/` dnsmasq rules to `misc.dnsmasq_lines` (auto-removes blanket parent-domain rules)
+8. Saves the cache hash on success
 
 ## Quick Start
 
@@ -82,6 +84,7 @@ All configuration is via environment variables:
 | `RETRY_ATTEMPTS` | `3` | Number of retry attempts for failed API requests |
 | `RETRY_BACKOFF_BASE` | `2.0` | Base for exponential backoff (seconds) |
 | `SYNC_INTERVAL` | `120` | Seconds between sync cycles in `--daemon` mode |
+| `MANAGE_LOCAL_DNS` | `true` | Manage per-host `local=/fqdn/` dnsmasq rules |
 
 ## Pi-hole Setup
 
@@ -142,6 +145,21 @@ This is enabled by default. To log conflicts without removing them, use:
 
 ```bash
 python3 sync.py --no-replace-conflicts
+```
+
+## Per-Host Local DNS Rules
+
+When `MANAGE_LOCAL_DNS=true` (default), the script manages `local=/fqdn/` dnsmasq directives in Pi-hole's `misc.dnsmasq_lines` config for each synced hostname. This tells dnsmasq to be authoritative for those specific FQDNs, which:
+
+- **Fixes AAAA resolution** — queries for `AAAA home.example.com` return `NODATA` instead of being forwarded upstream and resolving to a public IPv6 address
+- **Doesn't hijack the parent domain** — unlike a blanket `local=/example.com/`, only the managed hostnames are affected; public subdomains like `external.example.com` still resolve via upstream DNS
+
+The script automatically detects and removes blanket parent-domain rules (e.g. `local=/example.com/`) that conflict with per-host rules. Non-`local=` entries in `dnsmasq_lines` are never touched.
+
+To disable this feature:
+
+```bash
+MANAGE_LOCAL_DNS=false
 ```
 
 ## Managed Entry Scope
