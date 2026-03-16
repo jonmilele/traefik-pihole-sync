@@ -521,7 +521,7 @@ def rollback(backup_file):
 def sync_pihole(host, desired_hostnames, replace_conflicts=True):
     """
     Sync the desired hostname set to a single Pi-hole instance.
-    Returns (added_list, removed_list, conflict_list, dnsmasq_added, dnsmasq_removed, had_errors).
+    Returns (added_list, removed_list, conflict_list, had_errors).
     Raises PiholeAuthError if authentication fails.
 
     If replace_conflicts is True, existing DNS entries for Traefik-managed
@@ -603,17 +603,7 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
                     continue
             removed.append(entry.split(" ", 1)[1])
 
-        # Sync per-host local= dnsmasq rules (if enabled)
-        dnsmasq_added = []
-        dnsmasq_removed = []
-        if MANAGE_LOCAL_DNS:
-            dnsmasq_added, dnsmasq_removed, dnsmasq_errors = sync_dnsmasq_local_rules(
-                host, headers, desired_hostnames,
-            )
-            if dnsmasq_errors:
-                errors = True
-
-        return added, removed, conflicts, dnsmasq_added, dnsmasq_removed, errors
+        return added, removed, conflicts, errors
     finally:
         pihole_logout(host, sid)
 
@@ -710,72 +700,100 @@ def run_sync(replace_conflicts=True):
     hostnames = extract_hostnames(routers)
     log.debug("Resolved %d unique hostnames: %s", len(hostnames), ", ".join(hostnames))
 
-    # Step 3: Change detection
+    # Step 3: Change detection — only gates DNS host sync, not dnsmasq rules
     current_hash = compute_hash(hostnames)
-    if not has_changed(current_hash):
-        log.info("NO CHANGE (%d hostnames)", len(hostnames))
-        return EXIT_OK
+    dns_changed = has_changed(current_hash)
 
-    # Step 4: Sync to each Pi-hole instance (per-instance resilience)
+    # Step 4: Sync DNS host records (only when hostname list changed)
     all_added = []
     all_removed = []
     all_conflicts = []
     failed_hosts = []
 
+    if dns_changed:
+        for host in PIHOLE_HOSTS:
+            log.info("Syncing to Pi-hole %s ...", host)
+            try:
+                added, removed, conflicts, errors = sync_pihole(
+                    host, hostnames, replace_conflicts,
+                )
+                all_added.extend(added)
+                all_removed.extend(removed)
+                all_conflicts.extend(conflicts)
+                if errors:
+                    failed_hosts.append(host)
+            except PiholeAuthError as e:
+                log.error("Skipping Pi-hole %s: %s", host, e)
+                failed_hosts.append(host)
+            except Exception as e:
+                log.error("Unexpected error syncing to Pi-hole %s: %s", host, e)
+                failed_hosts.append(host)
+
+        # Update cache and prune old backups
+        if not DRY_RUN:
+            if not failed_hosts:
+                save_cache(current_hash)
+            else:
+                log.warning(
+                    "Errors on %d/%d Pi-hole(s) (%s) — cache NOT updated (will retry next run)",
+                    len(failed_hosts), len(PIHOLE_HOSTS), ", ".join(failed_hosts),
+                )
+            prune_backups()
+    else:
+        log.info("NO CHANGE (%d hostnames)", len(hostnames))
+
+    # Step 5: Reconcile dnsmasq local= rules (runs every cycle, independent of
+    # hostname hash, so rules are self-healing if a Pi-hole was down or drifted)
     all_dnsmasq_added = []
     all_dnsmasq_removed = []
+    dnsmasq_failed = []
 
-    for host in PIHOLE_HOSTS:
-        log.info("Syncing to Pi-hole %s ...", host)
-        try:
-            added, removed, conflicts, dnsmasq_added, dnsmasq_removed, errors = sync_pihole(
-                host, hostnames, replace_conflicts,
-            )
-            all_added.extend(added)
-            all_removed.extend(removed)
-            all_conflicts.extend(conflicts)
-            all_dnsmasq_added.extend(dnsmasq_added)
-            all_dnsmasq_removed.extend(dnsmasq_removed)
-            if errors:
-                failed_hosts.append(host)
-        except PiholeAuthError as e:
-            log.error("Skipping Pi-hole %s: %s", host, e)
-            failed_hosts.append(host)
-        except Exception as e:
-            log.error("Unexpected error syncing to Pi-hole %s: %s", host, e)
-            failed_hosts.append(host)
-
-    # Step 5: Update cache and prune old backups
-    if not DRY_RUN:
-        if not failed_hosts:
-            save_cache(current_hash)
-        else:
-            log.warning(
-                "Errors on %d/%d Pi-hole(s) (%s) — cache NOT updated (will retry next run)",
-                len(failed_hosts), len(PIHOLE_HOSTS), ", ".join(failed_hosts),
-            )
-        prune_backups()
+    if MANAGE_LOCAL_DNS:
+        for host in PIHOLE_HOSTS:
+            try:
+                sid, headers = pihole_authenticate(host)
+                try:
+                    dnsmasq_added, dnsmasq_removed, dnsmasq_errors = sync_dnsmasq_local_rules(
+                        host, headers, hostnames,
+                    )
+                    all_dnsmasq_added.extend(dnsmasq_added)
+                    all_dnsmasq_removed.extend(dnsmasq_removed)
+                    if dnsmasq_errors:
+                        dnsmasq_failed.append(host)
+                finally:
+                    pihole_logout(host, sid)
+            except PiholeAuthError as e:
+                log.error("Skipping dnsmasq sync for Pi-hole %s: %s", host, e)
+                dnsmasq_failed.append(host)
+            except Exception as e:
+                log.error("Unexpected error in dnsmasq sync for Pi-hole %s: %s", host, e)
+                dnsmasq_failed.append(host)
 
     # Step 6: Log summary
-    added_unique = sorted(set(all_added))
-    removed_unique = sorted(set(all_removed))
-    conflict_unique = sorted(set(all_conflicts))
+    if dns_changed:
+        added_unique = sorted(set(all_added))
+        removed_unique = sorted(set(all_removed))
+        conflict_unique = sorted(set(all_conflicts))
+        summary = "SYNC: +%d -%d" % (len(added_unique), len(removed_unique))
+        if conflict_unique:
+            summary += " ~%d conflicts" % len(conflict_unique)
+        log.info(
+            "%s | added: %s | removed: %s",
+            summary,
+            ", ".join(added_unique) if added_unique else "(none)",
+            ", ".join(removed_unique) if removed_unique else "(none)",
+        )
+
     dnsmasq_added_unique = sorted(set(all_dnsmasq_added))
     dnsmasq_removed_unique = sorted(set(all_dnsmasq_removed))
-
-    summary = "SYNC: +%d -%d" % (len(added_unique), len(removed_unique))
-    if conflict_unique:
-        summary += " ~%d conflicts" % len(conflict_unique)
     if dnsmasq_added_unique or dnsmasq_removed_unique:
-        summary += " | dnsmasq local= +%d -%d" % (len(dnsmasq_added_unique), len(dnsmasq_removed_unique))
-    log.info(
-        "%s | added: %s | removed: %s",
-        summary,
-        ", ".join(added_unique) if added_unique else "(none)",
-        ", ".join(removed_unique) if removed_unique else "(none)",
-    )
+        log.info(
+            "DNSMASQ: local= +%d -%d",
+            len(dnsmasq_added_unique), len(dnsmasq_removed_unique),
+        )
 
-    return EXIT_PIHOLE_ERROR if failed_hosts else EXIT_OK
+    all_failed = sorted(set(failed_hosts + dnsmasq_failed))
+    return EXIT_PIHOLE_ERROR if all_failed else EXIT_OK
 
 
 def main():
