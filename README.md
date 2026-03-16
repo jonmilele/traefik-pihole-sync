@@ -22,12 +22,12 @@ When services are added or removed behind Traefik, this script polls the Traefik
 
 1. Fetches all HTTP routers from Traefik's API
 2. Extracts hostnames from `Host()` rules, filtering out internal/blocklisted routers
-3. Compares against a cached hash — exits early if nothing changed
-4. Authenticates with each Pi-hole v6 instance
-5. Backs up current DNS entries to a timestamped JSON file
-6. Diffs desired vs. current entries (scoped to the Traefik IP) and applies adds/removes
-7. Syncs per-host `local=/fqdn/` dnsmasq rules to `misc.dnsmasq_lines` (auto-removes blanket parent-domain rules)
-8. Saves the cache hash on success
+3. **DNS host sync** (hash-gated) — compares against a cached hash; if hostnames changed:
+   - Authenticates with each Pi-hole v6 instance
+   - Backs up current DNS entries to a timestamped JSON file
+   - Diffs desired vs. current entries (scoped to the Traefik IP) and applies adds/removes
+   - Saves the cache hash on success
+4. **dnsmasq rule sync** (every cycle) — reconciles per-host `local=/fqdn/` rules in `misc.dnsmasq_lines` independently of the hash check, so rules self-heal if a Pi-hole was down during a previous sync
 
 ## Quick Start
 
