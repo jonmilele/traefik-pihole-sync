@@ -531,9 +531,6 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
     try:
         current_entries = pihole_get_hosts(host, headers)
 
-        # Backup current state before making changes
-        backup_pihole_hosts(host, headers)
-
         # Build a map of hostname -> list of IPs from current entries
         current_by_hostname = {}
         for entry in current_entries:
@@ -541,32 +538,13 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
             if len(parts) == 2:
                 current_by_hostname.setdefault(parts[1], []).append(parts[0])
 
-        # Detect and handle conflicting entries (same hostname, different IP)
+        # Detect conflicting entries (same hostname, different IP)
         conflicts = []
         for hostname in desired_hostnames:
             existing_ips = current_by_hostname.get(hostname, [])
             for ip in existing_ips:
                 if ip != TRAEFIK_IP:
-                    old_entry = f"{ip} {hostname}"
-                    conflicts.append(old_entry)
-                    if replace_conflicts:
-                        if DRY_RUN:
-                            log.warning(
-                                "[DRY RUN] CONFLICT on %s: %s points to %s (would replace with %s)",
-                                host, hostname, ip, TRAEFIK_IP,
-                            )
-                        else:
-                            log.warning(
-                                "CONFLICT on %s: %s points to %s — replacing with %s",
-                                host, hostname, ip, TRAEFIK_IP,
-                            )
-                            if not pihole_delete_host(host, headers, old_entry):
-                                log.error("Failed to remove conflicting entry from %s: %s", host, old_entry)
-                    else:
-                        log.warning(
-                            "CONFLICT on %s: %s points to %s (not replacing — use default or omit --no-replace-conflicts)",
-                            host, hostname, ip,
-                        )
+                    conflicts.append(f"{ip} {hostname}")
 
         # Build sets for comparison — only consider entries matching TRAEFIK_IP
         desired_entries = {f"{TRAEFIK_IP} {h}" for h in desired_hostnames}
@@ -575,9 +553,36 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
         to_add = desired_entries - current_traefik
         to_remove = current_traefik - desired_entries
 
+        # Backup only if we are about to mutate host records on this Pi-hole
+        if (not DRY_RUN) and (to_add or to_remove or (replace_conflicts and conflicts)):
+            backup_pihole_hosts(host, headers)
+
         added = []
         removed = []
         errors = False
+
+        # Handle conflicts first so replacements can be added cleanly
+        for old_entry in sorted(set(conflicts)):
+            ip, hostname = old_entry.split(" ", 1)
+            if replace_conflicts:
+                if DRY_RUN:
+                    log.warning(
+                        "[DRY RUN] CONFLICT on %s: %s points to %s (would replace with %s)",
+                        host, hostname, ip, TRAEFIK_IP,
+                    )
+                else:
+                    log.warning(
+                        "CONFLICT on %s: %s points to %s — replacing with %s",
+                        host, hostname, ip, TRAEFIK_IP,
+                    )
+                    if not pihole_delete_host(host, headers, old_entry):
+                        log.error("Failed to remove conflicting entry from %s: %s", host, old_entry)
+                        errors = True
+            else:
+                log.warning(
+                    "CONFLICT on %s: %s points to %s (not replacing — use default or omit --no-replace-conflicts)",
+                    host, hostname, ip,
+                )
 
         for entry in sorted(to_add):
             if DRY_RUN:
@@ -603,7 +608,7 @@ def sync_pihole(host, desired_hostnames, replace_conflicts=True):
                     continue
             removed.append(entry.split(" ", 1)[1])
 
-        return added, removed, conflicts, errors
+        return added, removed, sorted(set(conflicts)), errors
     finally:
         pihole_logout(host, sid)
 
@@ -700,47 +705,46 @@ def run_sync(replace_conflicts=True):
     hostnames = extract_hostnames(routers)
     log.debug("Resolved %d unique hostnames: %s", len(hostnames), ", ".join(hostnames))
 
-    # Step 3: Change detection — only gates DNS host sync, not dnsmasq rules
+    # Step 3: Source change detection (for cache/reporting)
     current_hash = compute_hash(hostnames)
     dns_changed = has_changed(current_hash)
+    if not dns_changed:
+        log.info("NO CHANGE (%d hostnames)", len(hostnames))
 
-    # Step 4: Sync DNS host records (only when hostname list changed)
+    # Step 4: Sync DNS host records every cycle (self-healing drift recovery)
     all_added = []
     all_removed = []
     all_conflicts = []
     failed_hosts = []
 
-    if dns_changed:
-        for host in PIHOLE_HOSTS:
-            log.info("Syncing to Pi-hole %s ...", host)
-            try:
-                added, removed, conflicts, errors = sync_pihole(
-                    host, hostnames, replace_conflicts,
-                )
-                all_added.extend(added)
-                all_removed.extend(removed)
-                all_conflicts.extend(conflicts)
-                if errors:
-                    failed_hosts.append(host)
-            except PiholeAuthError as e:
-                log.error("Skipping Pi-hole %s: %s", host, e)
+    for host in PIHOLE_HOSTS:
+        log.info("Syncing to Pi-hole %s ...", host)
+        try:
+            added, removed, conflicts, errors = sync_pihole(
+                host, hostnames, replace_conflicts,
+            )
+            all_added.extend(added)
+            all_removed.extend(removed)
+            all_conflicts.extend(conflicts)
+            if errors:
                 failed_hosts.append(host)
-            except Exception as e:
-                log.error("Unexpected error syncing to Pi-hole %s: %s", host, e)
-                failed_hosts.append(host)
+        except PiholeAuthError as e:
+            log.error("Skipping Pi-hole %s: %s", host, e)
+            failed_hosts.append(host)
+        except Exception as e:
+            log.error("Unexpected error syncing to Pi-hole %s: %s", host, e)
+            failed_hosts.append(host)
 
-        # Update cache and prune old backups
-        if not DRY_RUN:
-            if not failed_hosts:
-                save_cache(current_hash)
-            else:
-                log.warning(
-                    "Errors on %d/%d Pi-hole(s) (%s) — cache NOT updated (will retry next run)",
-                    len(failed_hosts), len(PIHOLE_HOSTS), ", ".join(failed_hosts),
-                )
-            prune_backups()
-    else:
-        log.info("NO CHANGE (%d hostnames)", len(hostnames))
+    # Update cache and prune old backups
+    if not DRY_RUN:
+        if not failed_hosts:
+            save_cache(current_hash)
+        else:
+            log.warning(
+                "Errors on %d/%d Pi-hole(s) (%s) — cache NOT updated (will retry next run)",
+                len(failed_hosts), len(PIHOLE_HOSTS), ", ".join(failed_hosts),
+            )
+        prune_backups()
 
     # Step 5: Reconcile dnsmasq local= rules (runs every cycle, independent of
     # hostname hash, so rules are self-healing if a Pi-hole was down or drifted)
@@ -770,10 +774,10 @@ def run_sync(replace_conflicts=True):
                 dnsmasq_failed.append(host)
 
     # Step 6: Log summary
-    if dns_changed:
-        added_unique = sorted(set(all_added))
-        removed_unique = sorted(set(all_removed))
-        conflict_unique = sorted(set(all_conflicts))
+    added_unique = sorted(set(all_added))
+    removed_unique = sorted(set(all_removed))
+    conflict_unique = sorted(set(all_conflicts))
+    if dns_changed or added_unique or removed_unique or conflict_unique:
         summary = "SYNC: +%d -%d" % (len(added_unique), len(removed_unique))
         if conflict_unique:
             summary += " ~%d conflicts" % len(conflict_unique)
